@@ -13,8 +13,9 @@ from urllib.parse import urlsplit
 import boto3
 import botocore
 import smart_open.s3
+from botocore.awsrequest import AWSResponse
 
-from megfile.errors import S3BucketNotFoundError, S3ConfigError, S3FileExistsError, S3FileNotFoundError, S3IsADirectoryError, S3NotADirectoryError, S3PermissionError, S3UnknownError, UnsupportedError, _create_missing_ok_generator
+from megfile.errors import S3BucketNotFoundError, S3ConfigError, S3FileExistsError, S3FileNotFoundError, S3IsADirectoryError, S3NameTooLongError, S3NotADirectoryError, S3NotALinkError, S3PermissionError, S3UnknownError, UnsupportedError, _create_missing_ok_generator
 from megfile.errors import _logger as error_logger
 from megfile.errors import patch_method, raise_s3_error, s3_should_retry, translate_fs_error, translate_s3_error
 from megfile.interfaces import Access, FileCacher, FileEntry, PathLike, StatResult
@@ -29,13 +30,13 @@ from megfile.lib.s3_memory_handler import S3MemoryHandler
 from megfile.lib.s3_pipe_handler import S3PipeHandler
 from megfile.lib.s3_prefetch_reader import DEFAULT_BLOCK_SIZE, S3PrefetchReader
 from megfile.lib.s3_share_cache_reader import S3ShareCacheReader
-from megfile.utils import generate_cache_path, get_binary_mode, get_content_offset, is_readable, thread_local
+from megfile.utils import calculate_md5, generate_cache_path, get_binary_mode, get_content_offset, is_readable, thread_local
 
 # Monkey patch for smart_open
 _smart_open_parameters = inspect.signature(smart_open.s3.open).parameters
 if 'resource_kwargs' in _smart_open_parameters:
     # smart_open >= 1.8.1
-    def _s3_open(bucket: str, key: str, mode: str):
+    def _s3_open(bucket: str, key: str, mode: str):  # pragma: no cover
         return smart_open.s3.open(
             bucket,
             key,
@@ -50,7 +51,7 @@ elif 'client' in _smart_open_parameters:
 
 else:
     # smart_open < 1.8.1, >= 1.6.0
-    def _s3_open(bucket: str, key: str, mode: str):
+    def _s3_open(bucket: str, key: str, mode: str):  # pragma: no cover
         return smart_open.s3.open(
             bucket,
             key,
@@ -99,6 +100,9 @@ __all__ = [
     's3_unlink',
     's3_upload',
     's3_walk',
+    's3_symlink',
+    's3_readlink',
+    's3_islink',
     'get_endpoint_url',
     'parse_s3_url',
     'get_s3_client',
@@ -126,8 +130,15 @@ def get_endpoint_url() -> str:
     returns: S3 endpoint url
     '''
     environ_endpoint_url = os.environ.get('OSS_ENDPOINT')
+    if environ_endpoint_url:
+        _logger.info("using OSS_ENDPOINT: %s" % environ_endpoint_url)
+        return environ_endpoint_url
     config_endpoint_url = get_scoped_config().get('s3', {}).get('endpoint_url')
-    return environ_endpoint_url or config_endpoint_url or endpoint_url
+    if config_endpoint_url:
+        _logger.info(
+            "using ~/.aws/config: endpoint_url=%s" % config_endpoint_url)
+        return config_endpoint_url
+    return endpoint_url
 
 
 def get_s3_session():
@@ -143,6 +154,20 @@ max_retries = 10
 
 
 def _patch_make_request(client: botocore.client.BaseClient):
+
+    def after_callback(result: Tuple[AWSResponse, dict], *args, **kwargs):
+        if not isinstance(result, tuple) or len(result) != 2 \
+            or not isinstance(result[0], AWSResponse) or not isinstance(result[1], dict):
+            return result
+        http, parsed_response = result
+        if http.status_code >= 500:
+            error_code = parsed_response.get("Error", {}).get("Code")
+            operation_model = kwargs.get('operation_model') or (
+                args[0] if args else None)
+            operation_name = operation_model.name if operation_model else 'ProxyMethod'
+            error_class = client.exceptions.from_code(error_code)
+            raise error_class(parsed_response, operation_name)
+        return result
 
     def retry_callback(error, operation_model, request_dict, request_context):
         if error is None:  # retry for the first time
@@ -161,12 +186,13 @@ def _patch_make_request(client: botocore.client.BaseClient):
         client._make_request,
         max_retries=max_retries,
         should_retry=s3_should_retry,
+        after_callback=after_callback,
         before_callback=before_callback,
         retry_callback=retry_callback)
     return client
 
 
-def _patch_send_request():
+def _patch_send_request():  # pragma: no cover
     # From: https://github.com/boto/botocore/pull/1328
     try:
         import botocore.awsrequest
@@ -264,7 +290,7 @@ def s3_copy(
 
     if not src_bucket:
         raise S3BucketNotFoundError('Empty bucket name: %r' % src_url)
-    if not src_key or src_key.endswith('/'):
+    if s3_isdir(src_url):
         raise S3IsADirectoryError('Is a directory: %r' % src_url)
 
     if not dst_bucket:
@@ -290,8 +316,6 @@ def s3_copy(
                 raise S3BucketNotFoundError('No such bucket: %r' % src_url)
         elif isinstance(error, S3FileNotFoundError):
             if not s3_isfile(src_url):
-                if s3_isdir(src_url):
-                    raise S3IsADirectoryError('Is a directory: %r' % src_url)
                 raise S3FileNotFoundError('No such file: %r' % src_url)
         raise error
 
@@ -309,7 +333,6 @@ def s3_isdir(s3_url: PathLike) -> bool:
     bucket, key = parse_s3_url(s3_url)
     if not bucket:  # s3:// => True, s3:///key => False
         return not key
-
     prefix = _become_prefix(key)
     client = get_s3_client()
     try:
@@ -331,7 +354,7 @@ def s3_isdir(s3_url: PathLike) -> bool:
         len(resp.get('CommonPrefixes', [])) > 0
 
 
-def s3_isfile(s3_url: PathLike) -> bool:
+def s3_isfile(s3_url: PathLike, followlinks: bool = False) -> bool:
     '''
     Test if an s3_url is file
 
@@ -344,6 +367,8 @@ def s3_isfile(s3_url: PathLike) -> bool:
         return False
 
     client = get_s3_client()
+    if followlinks and s3_islink(s3_url):
+        return s3_isfile(s3_readlink(s3_url))
     try:
         client.head_object(Bucket=bucket, Key=key)
     except Exception as error:
@@ -410,7 +435,7 @@ def s3_hasbucket(s3_url: PathLike) -> bool:
     return True
 
 
-def s3_exists(s3_url: PathLike) -> bool:
+def s3_exists(s3_url: PathLike, followlinks: bool = False) -> bool:
     '''
     Test if s3_url exists
 
@@ -423,7 +448,7 @@ def s3_exists(s3_url: PathLike) -> bool:
     if not bucket:  # s3:// => True, s3:///key => False
         return not key
 
-    return s3_isfile(s3_url) or s3_isdir(s3_url)
+    return s3_isfile(s3_url, followlinks) or s3_isdir(s3_url)
 
 
 max_keys = 1000
@@ -496,7 +521,7 @@ def s3_scandir(s3_url: PathLike) -> Iterator[FileEntry]:
     return create_generator()
 
 
-def s3_listdir(s3_url: str) -> List[str]:
+def s3_listdir(s3_url: PathLike) -> List[str]:
     '''
     Get all contents of given s3_url. The result is in acsending alphabetical order.
 
@@ -543,23 +568,18 @@ def s3_stat(s3_url: PathLike) -> StatResult:
     Get StatResult of s3_url file, including file size and mtime, referring to s3_getsize and s3_getmtime
 
     If s3_url is not an existent path, which means s3_exist(s3_url) returns False, then raise S3FileNotFoundError
-    If attempt to get StatResult of complete s3, such as s3_dir_url == 's3://', raise UnsupportedError
+    If attempt to get StatResult of complete s3, such as s3_dir_url == 's3://', raise S3BucketNotFoundError
 
     :param s3_url: Given s3 path
     :returns: StatResult
-    :raises: S3FileNotFoundError, UnsupportedError
+    :raises: S3FileNotFoundError, S3BucketNotFoundError
     '''
     bucket, key = parse_s3_url(s3_url)
     if not bucket:
-        if not key:
-            raise UnsupportedError('Get stat of whole s3', s3_url)
         raise S3BucketNotFoundError('Empty bucket name: %r' % s3_url)
 
     if not s3_isfile(s3_url):
         return _s3_getdirstat(s3_url)
-
-    if not key or key.endswith('/'):
-        raise S3FileNotFoundError('No such directory: %r' % s3_url)
 
     client = get_s3_client()
     with raise_s3_error(s3_url):
@@ -618,23 +638,9 @@ def s3_upload(
 
     client = get_s3_client()
     with open(src_url, 'rb') as src:
-        # TODO: when have the 2nd md5 use case, extract this.
-        hash_md5 = hashlib.md5()  # nosec
-        for chunk in iter(lambda: src.read(4096), b''):
-            hash_md5.update(chunk)
-        md5 = hash_md5.hexdigest()
-        src.seek(0)
-
         with raise_s3_error(dst_url):
-            # TODO: better design for metadata scheme when we have another metadata field.
             client.upload_fileobj(
-                src,
-                Bucket=dst_bucket,
-                Key=dst_key,
-                ExtraArgs={'Metadata': {
-                    content_md5_header: md5,
-                }},
-                Callback=callback)
+                src, Bucket=dst_bucket, Key=dst_key, Callback=callback)
 
 
 def s3_download(
@@ -650,7 +656,11 @@ def s3_download(
     src_bucket, src_key = parse_s3_url(src_url)
     if not src_bucket:
         raise S3BucketNotFoundError('Empty bucket name: %r' % src_url)
-    if not src_key or src_key.endswith('/'):
+
+    if not s3_exists(src_url):
+        raise FileNotFoundError('File not found: %r' % src_url)
+
+    if not s3_isfile(src_url):
         raise S3IsADirectoryError('Is a directory: %r' % src_url)
 
     dst_url = fspath(dst_url)
@@ -664,11 +674,9 @@ def s3_download(
     client = get_s3_client()
     try:
         client.download_file(src_bucket, src_key, dst_url, Callback=callback)
-    except Exception as error:
+    except Exception as error:  # pragma: no cover
         error = translate_fs_error(error, dst_url)
         error = translate_s3_error(error, src_url)
-        if isinstance(error, S3FileNotFoundError) and s3_isdir(src_url):
-            raise S3IsADirectoryError('Is a directory: %r' % src_url)
         raise error
 
 
@@ -1066,7 +1074,8 @@ def _group_s3path_by_bucket(s3_pathname: str) -> List[str]:
             for bucket in all_bucket():
                 if pattern.fullmatch(bucket) is not None:
                     if path_part is not None:
-                        bucket = "%s/%s" % (bucket, path_part)
+                        bucket = "%s/%s" % (
+                            bucket, path_part)  # pragma: no cover
                     grouped_path.append(generate_s3_path(bucket, key))
         else:
             grouped_path.append(generate_s3_path(bucketname, key))
@@ -1233,7 +1242,7 @@ def s3_prefetch_open(
     :raises: S3FileNotFoundError
     '''
     if mode != 'rb':
-        raise ValueError('unacceptable mode: %r' % mode)
+        raise ValueError('unacceptable mode: %r' % mode)  # pragma: no cover
 
     bucket, key = parse_s3_url(s3_url)
     config = botocore.config.Config(max_pool_connections=max_pool_connections)
@@ -1271,7 +1280,7 @@ def s3_share_cache_open(
     :raises: S3FileNotFoundError
     '''
     if mode != 'rb':
-        raise ValueError('unacceptable mode: %r' % mode)
+        raise ValueError('unacceptable mode: %r' % mode)  # pragma: no cover
 
     bucket, key = parse_s3_url(s3_url)
     config = botocore.config.Config(max_pool_connections=max_pool_connections)
@@ -1307,7 +1316,7 @@ def s3_pipe_open(
     :returns: An opened BufferedReader / BufferedWriter object
     '''
     if mode not in ('rb', 'wb'):
-        raise ValueError('unacceptable mode: %r' % mode)
+        raise ValueError('unacceptable mode: %r' % mode)  # pragma: no cover
 
     if mode[0] == 'r' and not s3_isfile(s3_url):
         raise S3FileNotFoundError('No such file: %r' % s3_url)
@@ -1321,7 +1330,8 @@ def s3_pipe_open(
 
 @_s3_binary_mode
 def s3_cached_open(
-        s3_url: PathLike, mode: str, *, cache_path: str) -> S3CachedHandler:
+        s3_url: PathLike, mode: str, *,
+        cache_path: Optional[str] = None) -> S3CachedHandler:
     '''Open a local-cache file reader / writer, for frequent random read / write
 
     .. note ::
@@ -1337,7 +1347,7 @@ def s3_cached_open(
     :returns: An opened BufferedReader / BufferedWriter object
     '''
     if mode not in ('rb', 'wb', 'ab', 'rb+', 'wb+', 'ab+'):
-        raise ValueError('unacceptable mode: %r' % mode)
+        raise ValueError('unacceptable mode: %r' % mode)  # pragma: no cover
 
     bucket, key = parse_s3_url(s3_url)
     config = botocore.config.Config(max_pool_connections=max_pool_connections)
@@ -1454,7 +1464,7 @@ def s3_memory_open(s3_url: PathLike, mode: str) -> S3MemoryHandler:
 
         Supports context manager
 
-    :param mode: Mode to open file, could be one of "rb", "wb" or "ab"
+    :param mode: Mode to open file, could be one of "rb", "wb", "ab", "rb+", "wb+" or "ab+"
     :returns: An opened BufferedReader / BufferedWriter object
     '''
     if mode not in ('rb', 'wb', 'ab', 'rb+', 'wb+', 'ab+'):
@@ -1479,14 +1489,14 @@ def s3_legacy_open(s3_url: PathLike, mode: str):
     :param mode: Mode to open file, either "rb" or "wb"
     :returns: File-Like Object
     '''
-    if mode not in ('rb', 'wb'):
+    if mode not in ('rb', 'wb'):  # pragma: no cover
         raise ValueError('unacceptable mode: %r' % mode)
 
     bucket, key = parse_s3_url(s3_url)
 
     try:
         return _s3_open(bucket, key, mode)
-    except Exception as error:
+    except Exception as error:  # pragma: no cover
         if isinstance(error, IOError):
             error_str = str(error)
             if 'NoSuchKey' in error_str:
@@ -1511,31 +1521,32 @@ def s3_legacy_open(s3_url: PathLike, mode: str):
 s3_open = s3_buffered_open
 
 
-def s3_getmd5(s3_url: PathLike) -> Optional[str]:
+def s3_getmd5(s3_url: PathLike, recalculate: bool = False) -> str:
     '''
     Get md5 meta info in files that uploaded/copied via megfile
 
     If meta info is lost or non-existent, return None
 
     :param s3_url: Specified path
+    :param recalculate: calculate md5 in real-time or return s3 etag
     :returns: md5 meta info
     '''
-    bucket, key = parse_s3_url(s3_url)
+    bucket, _ = parse_s3_url(s3_url)
     if not bucket:
         raise S3BucketNotFoundError('Empty bucket name: %r' % s3_url)
-    if not key or key.endswith('/'):
-        raise S3IsADirectoryError('Is a directory: %r' % s3_url)
-
-    client = get_s3_client()
-    with raise_s3_error(s3_url):
-        resp = client.head_object(Bucket=bucket, Key=key)
-    # boto3 does not lower the key of metadata
-    # https://github.com/boto/botocore/issues/1963
-    metadata = dict(
-        (key.lower(), value) for key, value in resp['Metadata'].items())
-    if content_md5_header in metadata:
-        return metadata[content_md5_header]
-    return None
+    stat = s3_stat(s3_url)
+    if stat.isdir is True:
+        hash_md5 = hashlib.md5()  # nosec
+        for file_name in s3_listdir(s3_url):
+            chunk = s3_getmd5(
+                s3_path_join(s3_url, file_name),
+                recalculate=recalculate).encode()
+            hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    if recalculate is True:
+        with s3_open(s3_url, 'rb') as f:
+            return calculate_md5(f)
+    return stat.extra.get('ETag', '')[1:-1]
 
 
 def s3_load_content(
@@ -1614,6 +1625,84 @@ def s3_sync(src_url: PathLike, dst_url: PathLike) -> None:
     '''
     for src_file_path, dst_file_path in _s3_scan_pairs(src_url, dst_url):
         s3_copy(src_file_path, dst_file_path)
+
+
+def s3_get_metadata(src_url: PathLike, bucket: str, key: str, client) -> dict:
+    with raise_s3_error(src_url):
+        resp = client.head_object(Bucket=bucket, Key=key)
+    return dict((key.lower(), value) for key, value in resp['Metadata'].items())
+
+
+def s3_islink(src_url: PathLike) -> bool:
+    '''
+    Test whether a path is link
+
+    :param path: Given path
+    :returns: True if a path is link, else False
+    :raises: S3NotALinkError
+    '''
+    try:
+        bucket, key = parse_s3_url(src_url)
+        if not bucket:
+            return False
+        if not key or key.endswith('/'):
+            return False
+        client = get_s3_client()
+        metadata = s3_get_metadata(
+            src_url, bucket=bucket, key=key, client=client)
+        return 'symlink_to' in metadata
+    except S3FileNotFoundError:
+        return False
+
+
+def s3_symlink(dst_url: PathLike, src_url: PathLike) -> None:
+    '''
+    Create a symbolic link pointing to src_url named dst_url.
+
+    :param dst_url: Desination path
+    :param src_url: Source path
+    :raises: S3NameTooLongError, S3BucketNotFoundError, S3IsADirectoryError
+    '''
+    if len(str(src_url).encode()) > 1024:
+        raise S3NameTooLongError('File name too long: %r' % dst_url)
+    src_bucket, src_key = parse_s3_url(src_url)
+    dst_bucket, dst_key = parse_s3_url(dst_url)
+
+    if not src_bucket:
+        raise S3BucketNotFoundError('Empty bucket name: %r' % src_url)
+    if not dst_bucket:
+        raise S3BucketNotFoundError('Empty bucket name: %r' % dst_url)
+    if not dst_key or dst_key.endswith('/'):
+        raise S3IsADirectoryError('Is a directory: %r' % dst_url)
+
+    client = get_s3_client()
+    metadata = s3_get_metadata(
+        src_url, bucket=src_bucket, key=src_key, client=client)
+    if 'symlink_to' in metadata:
+        src_url = metadata['symlink_to']
+    with raise_s3_error(dst_url):
+        client.put_object(
+            Bucket=dst_bucket, Key=dst_key, Metadata={"symlink_to": src_url})
+
+
+def s3_readlink(src_url: PathLike) -> PathLike:
+    '''
+    Return a string representing the path to which the symbolic link points.
+    :param src_url: Path to be read
+    :returns: Return a string representing the path to which the symbolic link points.
+    :raises: S3NameTooLongError, S3BucketNotFoundError, S3IsADirectoryError, S3NotALinkError
+    '''
+    bucket, key = parse_s3_url(src_url)
+    if not bucket:
+        raise S3BucketNotFoundError('Empty bucket name: %r' % src_url)
+    if not key or key.endswith('/'):
+        raise S3IsADirectoryError('Is a directory: %r' % src_url)
+    client = get_s3_client()
+    metadata = s3_get_metadata(src_url, bucket=bucket, key=key, client=client)
+    if not 'symlink_to' in metadata:
+        raise S3NotALinkError('Not a link: %r' % src_url)
+    else:
+        return metadata['symlink_to']
 
 
 class S3Cacher(FileCacher):

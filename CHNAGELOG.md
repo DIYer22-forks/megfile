@@ -1,6 +1,30 @@
 CHANGELOG
 =========
 
+## 0.1.1 - 2022.01.14
+- fix smart api bug
+
+## 0.1.0 - 2022.01.14
+
+- update get_md5, s3 use etag and support dir
+- fix py35 test about moto
+- add fs symlink support
+- support python 3.10
+
+## 0.0.11 - 2021.12.08
+
+- smart_open support read and write pipe
+
+## 0.0.10 - 2021.11.29
+
+- add info log about environ OSS_ENDPOINT and oss config file
+- smart_getsize and smart_getmtime support http
+- update cli cp and mv, make them like cp and mv in linux
+- fix sed warning in macOS
+- add some test code
+- add error code callback to _patch_make_request
+- Generate cache_path automatically
+
 ## 0.0.9 - 2021.10.11
 
 - `megfile.s3` retries when server returns 500 - 503

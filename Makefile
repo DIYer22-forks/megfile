@@ -1,8 +1,8 @@
 PACKAGE := megfile
-VERSION := $(shell cat ${PACKAGE}/version.py | sed -n -E 's/^VERSION = "(.+?)"/\1/p')
+VERSION := $(shell cat ${PACKAGE}/version.py | sed -n -E 's/.*=//; s/ //g; s/"//g; p')
 
 test:
-	pytest --cov-config=setup.cfg --cov=${PACKAGE} --disable-socket --no-cov-on-fail --cov-report=html:html_cov/ --cov-report term-missing tests/ --durations=10
+	pytest --cov-config=setup.cfg --cov=${PACKAGE} --disable-socket --no-cov-on-fail --cov-report=html:html_cov/ --cov-report term-missing --cov-report=xml tests/ --durations=10
 
 format:
 	isort ${PACKAGE} tests
@@ -13,11 +13,17 @@ style_check:
 	yapf --diff --recursive ${PACKAGE} tests
 
 static_check:
+	make pytype_check
+
+pytype_check:
 	pytype
 
-scan:
-	pyre --output=json check > errors.json || echo
-	cat errors.json | ./scripts/convert_results_to_sarif.py > sarif.json
+bandit_check:
+	bandit --format=sarif --recursive megfile/ > bandit-sarif.json || echo
+
+pyre_check:
+	pyre --output=json check > pyre-errors.json || echo
+	cat pyre-errors.json | ./scripts/convert_results_to_sarif.py > pyre-sarif.json
 
 mut:
 	@echo Mutation testing...

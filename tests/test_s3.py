@@ -1,8 +1,10 @@
+import hashlib
 import os
 import sys
 import threading
 import time
 from collections import namedtuple
+from enum import Enum
 from functools import partial
 from io import BytesIO
 from pathlib import Path
@@ -16,7 +18,7 @@ from moto import mock_s3
 from megfile import s3, smart
 from megfile.errors import UnknownError, UnsupportedError, translate_s3_error
 from megfile.interfaces import Access, FileEntry, StatResult
-from megfile.s3 import _group_s3path_by_bucket, _group_s3path_by_prefix, _s3_split_magic, content_md5_header
+from megfile.s3 import _group_s3path_by_bucket, _group_s3path_by_prefix, _s3_split_magic, content_md5_header, s3_isfile, s3_readlink, s3_symlink
 
 from . import Any, FakeStatResult, Now
 
@@ -165,6 +167,65 @@ def make_stat(size=0, mtime=None, isdir=False):
     return StatResult(size=size, mtime=mtime, isdir=isdir)
 
 
+class FakeOperateMode:
+
+    def __init__(self, name) -> None:
+        self.name = name
+        pass
+
+
+@pytest.fixture
+def s3_empty_client_with_patch_make_request(mocker):
+
+    def patch_make_request(
+            operation_model, request_dict, request_context, *args, **kwargs):
+        if operation_model.name == 'test_error':
+            raise s3.S3UnknownError(error=Exception(), path='test')
+        return request_context
+
+    with mock_s3():
+        client = boto3.client('s3')
+        client._make_request = patch_make_request
+        s3._patch_make_request(client)
+        mocker.patch('megfile.s3.get_s3_client', return_value=client)
+        yield client
+
+
+def test_patch_make_request(s3_empty_client_with_patch_make_request, mocker):
+    mocker.patch('megfile.s3.max_retries', 1)
+    body = BytesIO(b'test')
+    body.seek(4)
+    assert body.tell() == 4
+    with pytest.raises(s3.S3UnknownError):
+        s3_empty_client_with_patch_make_request._make_request(
+            FakeOperateMode(name='test_error'), dict(body=body), 'result')
+        assert body.tell() == 1
+
+    s3_empty_client_with_patch_make_request._make_request(
+        FakeOperateMode(name='test_result'), dict(body=body),
+        'test_result') == "test_result"
+
+    from botocore.awsrequest import AWSResponse
+
+    test_result_tuple = (
+        AWSResponse(url='http://test', status_code=200, headers={},
+                    raw=b''), {})
+    s3_empty_client_with_patch_make_request._make_request(
+        FakeOperateMode(name='test_result'), dict(body=body),
+        test_result_tuple) == test_result_tuple
+
+    test_error_result_tuple = (
+        AWSResponse(url='http://test', status_code=500, headers={}, raw=b''), {
+            "Error": {
+                "Code": 500
+            }
+        })
+    with pytest.raises(botocore.exceptions.ClientError):
+        s3_empty_client_with_patch_make_request._make_request(
+            FakeOperateMode(name='test_result'), dict(body=body),
+            test_error_result_tuple)
+
+
 def test_retry(s3_empty_client, mocker):
     read_error = botocore.exceptions.IncompleteReadError(
         actual_bytes=0, expected_bytes=1)
@@ -191,6 +252,16 @@ def test_get_endpoint_url_from_env(mocker):
     assert s3.get_endpoint_url() == 'oss-endpoint'
 
 
+def test_get_endpoint_url_from_scoped_config(mocker):
+    mocker.patch(
+        'megfile.s3.get_scoped_config',
+        return_value={'s3': {
+            'endpoint_url': 'test_endpoint_url'
+        }})
+
+    assert s3.get_endpoint_url() == 'test_endpoint_url'
+
+
 def test_get_s3_client(mocker):
     mock_session = mocker.Mock(spec=boto3.session.Session)
     mocker.patch('megfile.s3.get_scoped_config', return_value={})
@@ -200,6 +271,9 @@ def test_get_s3_client(mocker):
 
     mock_session.client.assert_called_with(
         's3', endpoint_url='https://s3.amazonaws.com', config=Any())
+
+    client = s3.get_s3_client(cache_key='test')
+    assert client is s3.get_s3_client(cache_key='test')
 
 
 def test_get_s3_client_from_env(mocker):
@@ -361,6 +435,9 @@ def test_parse_s3_url():
     assert s3.parse_s3_url('s3://bucket/prefix/key#key?key') == (
         'bucket', 'prefix/key#key?key')
 
+    with pytest.raises(ValueError):
+        s3.parse_s3_url('/test')
+
 
 def test_s3_scandir_internal(truncating_client):
 
@@ -403,6 +480,8 @@ def test_s3_scandir_internal(truncating_client):
         s3.s3_scandir('s3://notExistBucket')
     with pytest.raises(FileNotFoundError) as error:
         s3.s3_scandir('s3://bucketA/notExistFolder')
+    with pytest.raises(s3.S3BucketNotFoundError) as error:
+        s3.s3_scandir('s3:///notExistFolder')
 
 
 def test_s3_scandir(truncating_client):
@@ -549,7 +628,7 @@ def test_s3_copy_invalid(s3_empty_client):
         s3.s3_copy('s3://bucket/key', 's3://notExistBucket/key')
     assert 's3://notExistBucket/key' in str(error.value)
 
-    with pytest.raises(IsADirectoryError) as error:
+    with pytest.raises(s3.S3FileNotFoundError) as error:
         s3.s3_copy('s3://bucket/prefix/', 's3://bucket/key')
     assert 's3://bucket/prefix/' in str(error.value)
 
@@ -561,9 +640,12 @@ def test_s3_copy_invalid(s3_empty_client):
         s3.s3_copy('s3://notExistBucket/key', 's3://bucket/key')
     assert 's3://notExistBucket' in str(error.value)
 
-    with pytest.raises(FileNotFoundError) as error:
+    with pytest.raises(s3.S3FileNotFoundError) as error:
         s3.s3_copy('s3://bucket/notExistFile', 's3://bucket/key')
     assert 's3://bucket/notExistFile' in str(error.value)
+
+    with pytest.raises(s3.S3IsADirectoryError) as error:
+        s3.s3_copy('s3://bucket', 's3://bucket/key')
 
 
 def test_s3_getsize(truncating_client):
@@ -572,7 +654,7 @@ def test_s3_getsize(truncating_client):
     assert s3.s3_getsize('s3://bucketA/fileAA') == 6
     assert s3.s3_getsize('s3://bucketA/folderAB') == 6 + 6
 
-    with pytest.raises(UnsupportedError) as error:
+    with pytest.raises(s3.S3BucketNotFoundError) as error:
         assert s3.s3_getsize('s3://')
     assert 's3://' in str(error.value)
 
@@ -590,7 +672,7 @@ def test_s3_getmtime(truncating_client):
     assert s3.s3_getmtime('s3://bucketA/fileAA') == Now()
     assert s3.s3_getmtime('s3://bucketA/folderAB') == Now()
 
-    with pytest.raises(UnsupportedError) as error:
+    with pytest.raises(s3.S3BucketNotFoundError) as error:
         assert s3.s3_getmtime('s3://')
     assert 's3://' in str(error.value)
 
@@ -618,7 +700,7 @@ def test_s3_stat(truncating_client, mocker):
     # 有同名目录时，优先返回文件的状态
     assert s3.s3_stat('s3://bucketC/folder') == StatResult(size=4, mtime=Now())
 
-    with pytest.raises(UnsupportedError) as error:
+    with pytest.raises(s3.S3BucketNotFoundError) as error:
         assert s3.s3_stat('s3://')
     assert 's3://' in str(error.value)
 
@@ -628,9 +710,11 @@ def test_s3_stat(truncating_client, mocker):
         s3.s3_stat('s3://bucketA/notExistFile')
     with pytest.raises(FileNotFoundError) as error:
         s3.s3_stat('s3:///notExistFile')
+    with pytest.raises(s3.S3FileNotFoundError) as error:
+        s3.s3_stat('s3:///bucketA/')
 
 
-def test_s3_upload(fs, s3_empty_client):
+def test_s3_upload(s3_empty_client, fs):
     src_url = '/path/to/file'
 
     fs.create_file(src_url, contents='value')
@@ -640,14 +724,11 @@ def test_s3_upload(fs, s3_empty_client):
 
     body = s3_empty_client.get_object(
         Bucket='bucket', Key='result')['Body'].read().decode('utf-8')
-    md5 = s3_empty_client.head_object(
-        Bucket='bucket', Key='result')['Metadata'][content_md5_header]
 
     assert body == 'value'
-    assert md5 == '2063c1608d6e0baf80249c42e2be5804'  # md5('value').hexdigest()
 
 
-def test_s3_upload_invalid(fs, s3_empty_client):
+def test_s3_upload_invalid(s3_empty_client, fs):
     s3_empty_client.create_bucket(Bucket='bucket')
 
     src_url = '/path/to/file'
@@ -670,7 +751,7 @@ def test_s3_upload_invalid(fs, s3_empty_client):
     assert 's3://notExistBucket/key' in str(error.value)
 
 
-def test_s3_upload_is_directory(fs, s3_empty_client):
+def test_s3_upload_is_directory(s3_empty_client, fs):
     with pytest.raises(IsADirectoryError) as error:
         s3.s3_upload('/path/to/file', 's3://bucket/prefix/')
     assert 's3://bucket/prefix/' in str(error.value)
@@ -687,7 +768,7 @@ def test_s3_upload_is_directory(fs, s3_empty_client):
     assert src_url in str(error.value)
 
 
-def test_s3_download(fs, s3_setup):
+def test_s3_download(s3_setup, fs):
     dst_url = '/path/to/file'
 
     s3.s3_download('s3://bucketA/fileAA', dst_url)
@@ -713,8 +794,13 @@ def test_s3_download(fs, s3_setup):
         body = result.read().decode('utf-8')
         assert body == 'file'
 
+    dst_url = '/path/to/samename/dir'
 
-def test_s3_download_makedirs(mocker, fs, s3_setup):
+    with pytest.raises(s3.S3IsADirectoryError):
+        s3.s3_download('s3://bucketC/folderAA', dst_url)
+
+
+def test_s3_download_makedirs(s3_setup, mocker, fs):
     dst_url = '/path/to/another/file'
     dst_dir = os.path.dirname(dst_url)
     os.makedirs(dst_dir)
@@ -729,7 +815,7 @@ def test_s3_download_makedirs(mocker, fs, s3_setup):
     assert os.makedirs.call_count == 0
 
 
-def test_s3_download_is_directory(fs, s3_setup):
+def test_s3_download_is_directory(s3_setup, fs):
     with pytest.raises(IsADirectoryError) as error:
         s3.s3_download('s3://bucketA/fileAA', '')
 
@@ -742,33 +828,35 @@ def test_s3_download_is_directory(fs, s3_setup):
     assert 's3://bucketA' in str(error.value)
 
 
-def test_s3_download_invalid(fs, s3_setup):
+def test_s3_download_invalid(s3_setup, fs):
     dst_url = '/path/to/file'
 
-    with pytest.raises(IsADirectoryError) as error:
-        s3.s3_download('s3://bucket/prefix/', dst_url)
-    assert 's3://bucket/prefix/' in str(error.value)
+    with pytest.raises(s3.S3IsADirectoryError) as error:
+        s3.s3_download('s3://bucketA/folderAB', dst_url)
+    assert 's3://bucketA/folderAB' in str(error.value)
 
     with pytest.raises(PermissionError) as error:
         s3.s3_download('s3:///key', dst_url)
     assert 's3:///key' in str(error.value)
 
-    with pytest.raises(PermissionError) as error:
+    with pytest.raises(FileNotFoundError) as error:
         s3.s3_download('s3://notExistBucket/fileAA', dst_url)
-    assert 's3://notExistBucket' in str(error.value)
+    assert 's3://notExistBucket/fileAA' in str(error.value)
 
     with pytest.raises(FileNotFoundError) as error:
-        s3.s3_download('s3://bucket/notExistFile', dst_url)
-    assert 's3://bucket/notExistFile' in str(error.value)
+        s3.s3_download('s3://bucketA/notExistFile', dst_url)
+    assert 's3://bucketA/notExistFile' in str(error.value)
 
 
 def test_s3_remove(s3_setup):
-    with pytest.raises(UnsupportedError) as error:
-        s3.s3_remove('s3://')
+    with pytest.raises(s3.S3BucketNotFoundError) as error:
+        s3.s3_remove('s3:///key')
     assert 's3://' in str(error.value)
     with pytest.raises(UnsupportedError) as error:
         s3.s3_remove('s3://bucketA/')
     assert 's3://bucketA/' in str(error.value)
+    with pytest.raises(UnsupportedError) as error:
+        s3.s3_remove('s3://')
     with pytest.raises(FileNotFoundError) as error:
         s3.s3_remove('s3://bucketA/notExistFile')
     assert 's3://bucketA/notExistFile' in str(error.value)
@@ -803,6 +891,15 @@ def test_s3_move(truncating_client):
     s3.s3_move(
         's3://bucketA/folderAA/folderAAA', 's3://bucketA/folderAA/folderAAA1')
     assert s3.s3_exists('s3://bucketA/folderAA/folderAAA') is False
+    assert s3.s3_exists('s3://bucketA/folderAA/folderAAA1/fileAAAA')
+
+
+def test_s3_move_file(truncating_client):
+    smart.smart_touch('s3://bucketA/folderAA/folderAAA/fileAAAA')
+    s3.s3_move(
+        's3://bucketA/folderAA/folderAAA/fileAAAA',
+        's3://bucketA/folderAA/folderAAA1/fileAAAA')
+    assert s3.s3_exists('s3://bucketA/folderAA/folderAAA/fileAAAA') is False
     assert s3.s3_exists('s3://bucketA/folderAA/folderAAA1/fileAAAA')
 
 
@@ -1794,6 +1891,19 @@ def test_s3_glob_stat(truncating_client, mocker):
             ('s3://bucketForGlobTest/2/a', make_stat(isdir=True)),
         ])
 
+    assert_glob_stat(
+        's3://{bucketA/folderAB/fileAB,bucketC/folder/file}',
+        [
+            ('s3://bucketA/folderAB/fileAB', make_stat(size=6)),  # 同名文件
+            ('s3://bucketC/folder/file', make_stat(size=4)),  # 同名文件
+        ])
+
+    assert_glob_stat(
+        's3://{bucket*/fileAB,bucketC/folder/file}',
+        [
+            ('s3://bucketC/folder/file', make_stat(size=4)),  # 同名文件
+        ])
+
     # combination of '?' and []
     assert_glob_stat('s3://bucketForGlobTest/[2-3]/**/*?msg', [])
     assert_glob_stat(
@@ -1804,6 +1914,12 @@ def test_s3_glob_stat(truncating_client, mocker):
 
     with pytest.raises(UnsupportedError) as error:
         s3.s3_glob_stat('s3://')
+
+    with pytest.raises(s3.S3BucketNotFoundError) as error:
+        s3.s3_glob_stat('s3:///key')
+
+    with pytest.raises(ValueError) as error:
+        s3.s3_glob_stat('/')
 
     with pytest.raises(FileNotFoundError):
         list(
@@ -2062,6 +2178,9 @@ def test_s3_prefetch_open(s3_empty_client):
                              max_block_size=1) as reader:
         assert reader.read() == content
 
+    with pytest.raises(s3.S3BucketNotFoundError):
+        s3.s3_prefetch_open('s3://', max_concurrency=1, max_block_size=1)
+
 
 def test_s3_share_cache_open(s3_empty_client):
     content = b'test data for s3_share_cache_open'
@@ -2249,11 +2368,15 @@ def test_s3_buffered_open(mocker, s3_empty_client, fs):
     writer = s3.s3_buffered_open('s3://bucket/key', 'wb')
     assert isinstance(writer.raw, s3.S3BufferedWriter)
 
+    writer = s3.s3_buffered_open('s3://bucket/key', 'ab', cache_path='/test')
+    assert isinstance(writer, s3.S3CachedHandler)
+
     writer = s3.s3_buffered_open('s3://bucket/key', 'wb', limited_seekable=True)
     assert isinstance(writer.raw, s3.S3LimitedSeekableWriter)
 
-    reader = s3.s3_buffered_open('s3://bucket/key', 'rb')
+    reader = s3.s3_buffered_open('s3://bucket/key', 'rb', forward_ratio=0.5)
     assert isinstance(reader.raw, s3.S3PrefetchReader)
+    assert reader.raw._block_forward == s3.DEFAULT_MAX_BUFFER_SIZE // s3.DEFAULT_BLOCK_SIZE * 0.5
 
     reader = s3.s3_buffered_open(
         's3://bucket/key', 'rb', share_cache_key='share')
@@ -2270,6 +2393,10 @@ def test_s3_buffered_open(mocker, s3_empty_client, fs):
         assert reader.name == 's3://bucket/key'
         assert reader.mode == 'rb'
         assert reader.read() == content
+
+    with pytest.raises(ValueError):
+        with s3.s3_buffered_open('s3://bucket/key', 'test_mode'):
+            pass
 
 
 def test_s3_buffered_open_raises_exceptions(mocker, s3_empty_client, fs):
@@ -2313,6 +2440,10 @@ def test_s3_memory_open(s3_empty_client):
     with s3.s3_memory_open('s3://bucket/key', 'rb') as reader:
         assert reader.read() == content
 
+    with pytest.raises(ValueError):
+        with s3.s3_memory_open('s3://bucket/key', 'test_mode'):
+            pass
+
 
 def test_s3_open(s3_empty_client):
     content = b'test data for s3_open'
@@ -2334,11 +2465,23 @@ def test_s3_open(s3_empty_client):
 
 def test_s3_getmd5(s3_empty_client):
     s3_url = 's3://bucket/key'
+    content = b'bytes'
     s3_empty_client.create_bucket(Bucket='bucket')
-    s3_empty_client.put_object(
-        Bucket='bucket', Key='key', Metadata={content_md5_header: 'md5'})
+    s3_empty_client.put_object(Bucket='bucket', Key='key', Body=content)
 
-    assert s3.s3_getmd5(s3_url) == 'md5'
+    hash_md5 = hashlib.md5()  # nosec
+    hash_md5.update(content)
+
+    assert s3.s3_getmd5(s3_url) == hash_md5.hexdigest()
+    assert s3.s3_getmd5(s3_url, recalculate=True) == hash_md5.hexdigest()
+
+    s3_dir_url = 's3://bucket'
+    hash_md5_dir = hashlib.md5()  # nosec
+    hash_md5_dir.update(hash_md5.hexdigest().encode())
+    assert s3.s3_getmd5(s3_dir_url) == hash_md5_dir.hexdigest()
+
+    with pytest.raises(s3.S3BucketNotFoundError):
+        s3.s3_getmd5('s3://')
 
 
 def test_s3_getmd5_None(s3_empty_client):
@@ -2346,7 +2489,7 @@ def test_s3_getmd5_None(s3_empty_client):
     s3_empty_client.create_bucket(Bucket='bucket')
     s3_empty_client.put_object(Bucket='bucket', Key='key')
 
-    assert s3.s3_getmd5(s3_url) is None
+    assert s3.s3_getmd5(s3_url) == 'd41d8cd98f00b204e9800998ecf8427e'
 
 
 def test_s3_load_content(s3_empty_client):
@@ -2360,6 +2503,12 @@ def test_s3_load_content(s3_empty_client):
     assert s3.s3_load_content('s3://bucket/key', 1) == content[1:]
     assert s3.s3_load_content('s3://bucket/key', stop=-1) == content[:-1]
     assert s3.s3_load_content('s3://bucket/key', 4, 7) == content[4:7]
+
+    with pytest.raises(s3.S3BucketNotFoundError):
+        s3.s3_load_content('s3://', 5, 2)
+
+    with pytest.raises(s3.S3IsADirectoryError):
+        s3.s3_load_content('s3://bucket/', 5, 2)
 
     with pytest.raises(ValueError) as error:
         s3.s3_load_content('s3://bucket/key', 5, 2)
@@ -2383,7 +2532,7 @@ def test_s3_load_content_retry(s3_empty_client, mocker):
     assert sleep.call_count == s3.max_retries - 1
 
 
-def test_s3_cacher(fs, s3_empty_client):
+def test_s3_cacher(s3_empty_client, fs):
     content = b'test data for s3_load_content'
     s3_empty_client.create_bucket(Bucket='bucket')
     s3_empty_client.put_object(Bucket='bucket', Key='key', Body=content)
@@ -2414,3 +2563,202 @@ def test_s3_cacher(fs, s3_empty_client):
 
     assert not os.path.exists(path)
     assert s3.s3_load_content('s3://bucket/key') == content * 2
+
+    with pytest.raises(ValueError):
+        with s3.S3Cacher('s3://bucket/key', '/path/to/file', 'rb'):
+            pass
+
+
+@pytest.fixture
+def s3_empty_client_with_patch(mocker):
+    times = 0
+
+    def list_objects_v2(*args, **kwargs):
+        nonlocal times
+        times += 1
+        is_truncated = True
+        if times > 4:
+            is_truncated = False
+        return {
+            'IsTruncated': is_truncated,
+            'NextContinuationToken': times,
+            'Contents': ['test']
+        }
+
+    def error_method(*args, **kwargs):
+        raise s3.S3UnknownError()
+
+    with mock_s3():
+        client = boto3.client('s3')
+        client.list_objects_v2 = list_objects_v2
+        client.head_bucket = error_method
+        client.head_object = error_method
+        mocker.patch('megfile.s3.get_s3_client', return_value=client)
+        yield client
+
+
+def test_list_objects_recursive(s3_empty_client_with_patch):
+    assert list(
+        s3._list_objects_recursive(
+            s3_empty_client_with_patch, 'bucket', 'prefix', 'delimiter')) == [
+                {
+                    'IsTruncated': True,
+                    'Contents': ['test'],
+                    'NextContinuationToken': 1
+                },
+                {
+                    'IsTruncated': True,
+                    'Contents': ['test'],
+                    'NextContinuationToken': 2
+                },
+                {
+                    'IsTruncated': True,
+                    'Contents': ['test'],
+                    'NextContinuationToken': 3
+                },
+                {
+                    'IsTruncated': True,
+                    'Contents': ['test'],
+                    'NextContinuationToken': 4
+                },
+                {
+                    'IsTruncated': False,
+                    'Contents': ['test'],
+                    'NextContinuationToken': 5
+                },
+            ]
+
+
+def test_s3_split_magic_ignore_brace():
+    with pytest.raises(ValueError):
+        s3._s3_split_magic_ignore_brace("")
+
+    assert s3._s3_split_magic_ignore_brace("s3://bucket*") == (
+        "", "s3://bucket*")
+
+
+def test_group_s3path_by_prefix():
+    assert s3._group_s3path_by_prefix("s3://bucket*/test*") == [
+        "s3://bucket*/test*"
+    ]
+
+
+def test_s3_hasbucket(s3_empty_client_with_patch):
+    with pytest.raises(s3.S3UnknownError):
+        s3.s3_hasbucket('s3://bucketA')
+
+    assert s3.s3_hasbucket('s3://') is False
+
+
+def test_error(s3_empty_client_with_patch, mocker):
+
+    class FakeAccess(Enum):
+        READ = 1
+        WRITE = 2
+        ERROR = 3
+
+    mocker.patch('megfile.s3.Access', FakeAccess)
+    with pytest.raises(Exception):
+        s3.s3_access('s3://')
+    with pytest.raises(TypeError):
+        s3.s3_access('s3://bucketA/fileAA', FakeAccess.ERROR)
+    with pytest.raises(s3.S3UnknownError):
+        s3.s3_access('s3://bucketA/fileAA', FakeAccess.READ)
+
+    with pytest.raises(s3.S3UnknownError):
+        s3.s3_isfile('s3://bucketA/fileAA')
+
+    assert s3.s3_isdir('s3://bucket/dir') is True
+
+
+def test_exists_with_symlink(s3_empty_client):
+    src_url = 's3://bucket/src'
+    dst_url = 's3://bucket/dst'
+    content = b'bytes'
+    s3_empty_client.create_bucket(Bucket='bucket')
+    s3_empty_client.put_object(Bucket='bucket', Key='src', Body=content)
+
+    s3.s3_symlink(dst_url, src_url)
+    s3.s3_rename('s3://bucket/src', 's3://bucket/src_new')
+
+    assert s3.s3_exists(dst_url, followlinks=False) is True
+    assert s3.s3_exists(dst_url, followlinks=True) is False
+
+
+def test_symlink(s3_empty_client):
+    src_url = 's3://bucket/src'
+    dst_url = 's3://bucket/dst'
+    dst_dst_url = 's3://bucket/dst_dst'
+    content = b'bytes'
+    s3_empty_client.create_bucket(Bucket='bucket')
+    s3_empty_client.put_object(Bucket='bucket', Key='src', Body=content)
+
+    assert s3.s3_exists(dst_url) is False
+    s3.s3_symlink(dst_url, src_url)
+    s3.s3_symlink(dst_dst_url, dst_url)
+
+    assert s3.s3_exists(dst_url) is True
+    assert s3.s3_exists(dst_dst_url) is True
+
+    assert s3.s3_islink(dst_url) is True
+    assert s3.s3_islink(dst_dst_url) is True
+
+    assert s3.s3_readlink(dst_url) == src_url
+    assert s3.s3_readlink(dst_dst_url) == src_url
+
+    with pytest.raises(s3.S3BucketNotFoundError):
+        s3.s3_symlink(dst_url, 's3:///notExistFolder')
+    with pytest.raises(s3.S3BucketNotFoundError):
+        s3.s3_symlink('s3:///notExistFolder', src_url)
+    with pytest.raises(s3.S3IsADirectoryError):
+        s3.s3_symlink('s3://bucket/dst/', src_url)
+    with pytest.raises(s3.S3NameTooLongError):
+        s3.s3_symlink(dst_url, 's3://notExistFolder' + '/name/too/long' * 100)
+
+
+def test_islink(s3_empty_client):
+    assert s3.s3_islink('s3:///') is False
+    assert s3.s3_islink('s3://bucket/src/') is False
+    assert s3.s3_islink('s3://bucket/not') is False
+
+
+def test_read_symlink(s3_empty_client):
+    src_url = 's3://bucket/src'
+    dst_url = 's3://bucket/dst'
+    dst_dst_url = 's3://bucket/dst_dst'
+    content = b'bytes'
+    s3_empty_client.create_bucket(Bucket='bucket')
+    s3_empty_client.put_object(Bucket='bucket', Key='src', Body=content)
+
+    s3.s3_symlink(dst_url, src_url)
+    s3.s3_symlink(dst_dst_url, dst_url)
+
+    assert s3.s3_readlink(dst_url) == src_url
+    assert s3.s3_readlink(dst_dst_url) == src_url
+    assert s3.s3_islink('s3://bucket/src/') is False
+
+    with pytest.raises(s3.S3NotALinkError):
+        s3.s3_readlink(src_url)
+    with pytest.raises(s3.S3BucketNotFoundError):
+        s3.s3_readlink('s3:///notExistFolder')
+    with pytest.raises(s3.S3IsADirectoryError):
+        s3.s3_readlink('s3://bucket/dst/')
+
+
+def test_isfile_symlink(s3_empty_client):
+    src_url = 's3://bucket/src'
+    dst_url = 's3://bucket/dst'
+    dst_dst_url = 's3://bucket/dst_dst'
+    content = b'bytes'
+    s3_empty_client.create_bucket(Bucket='bucket')
+    s3_empty_client.put_object(Bucket='bucket', Key='src', Body=content)
+
+    s3.s3_symlink(dst_url, src_url)
+    s3.s3_symlink(dst_dst_url, dst_url)
+
+    assert s3.s3_isfile(dst_url, followlinks=True) is True
+    assert s3.s3_isfile(dst_dst_url, followlinks=True) is True
+
+    s3.s3_rename(src_url, 's3://bucket/src_new')
+    assert s3.s3_isfile(dst_url, followlinks=True) is False
+    assert s3.s3_isfile(dst_dst_url, followlinks=True) is False

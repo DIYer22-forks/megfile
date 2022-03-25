@@ -1,5 +1,5 @@
 from pathlib import PurePath
-from typing import Tuple
+from typing import Tuple, Union
 from urllib.parse import urlsplit
 
 from megfile.lib.compat import fspath
@@ -41,8 +41,12 @@ class SmartPath(BasePath):
         self.pathlike = pathlike
 
     @staticmethod
-    def _extract_protocol(path: PathLike) -> Tuple[str, str]:
-        if isinstance(path, str):
+    def _extract_protocol(path: Union[PathLike, int]
+                         ) -> Tuple[str, Union[str, int]]:
+        if isinstance(path, int):
+            protocol = "file"
+            path_without_protocol = path
+        elif isinstance(path, str):
             protocol = urlsplit(path).scheme
             if protocol == "":
                 protocol = "file"
@@ -60,7 +64,7 @@ class SmartPath(BasePath):
         return protocol, path_without_protocol
 
     @classmethod
-    def _create_pathlike(cls, path: PathLike) -> BasePath:
+    def _create_pathlike(cls, path: Union[PathLike, int]) -> BasePath:
         protocol, path_without_protocol = cls._extract_protocol(path)
         if protocol not in cls._registered_protocols:
             raise ProtocolNotFoundError(
@@ -76,6 +80,8 @@ class SmartPath(BasePath):
         cls._registered_protocols[protocol] = path_class
         return path_class
 
+    symlink_to = _bind_function('symlink_to')
+    readlink = _bind_function('readlink')
     is_dir = _bind_function('is_dir')
     is_file = _bind_function('is_file')
     is_symlink = _bind_function('is_symlink')
@@ -112,7 +118,7 @@ class SmartPath(BasePath):
 
     @property
     def protocol(self) -> str:
-        return self.pathlike.protocol
+        return self.pathlike.protocol  # pytype: disable=attribute-error
 
     @classmethod
     def from_uri(cls, path: str):

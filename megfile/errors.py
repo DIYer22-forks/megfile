@@ -33,6 +33,7 @@ __all__ = [
     'raise_s3_error',
     's3_should_retry',
     'translate_fs_error',
+    'http_should_retry',
 ]
 
 _logger = getLogger(__name__)
@@ -95,7 +96,8 @@ def s3_should_retry(error: Exception) -> bool:
         return True
     if isinstance(error, botocore.exceptions.ClientError):
         return client_error_code(error) in (
-            '500', '501', '502', '503', 'InternalError')
+            '500', '501', '502', '503', 'InternalError', 'ServiceUnavailable',
+            'SlowDown')
     return False
 
 
@@ -134,9 +136,9 @@ def patch_method(
             try:
                 result = func(*args, **kwargs)
                 if after_callback is not None:
-                    result = after_callback(result)
+                    result = after_callback(result, *args, **kwargs)
                 if error is not None:
-                    _logger.debug(
+                    _logger.debug(  # pragma: no cover
                         'unknown error resolved: %s, with %d tries' %
                         (full_error_message(error), retries))
                 return result
@@ -239,6 +241,14 @@ class S3ConfigError(S3Exception, EnvironmentError):
     '''
 
 
+class S3NotALinkError(S3FileNotFoundError, PermissionError):
+    pass
+
+
+class S3NameTooLongError(S3FileNotFoundError, PermissionError):
+    pass
+
+
 class S3UnknownError(S3Exception, UnknownError):
 
     def __init__(self, error: Exception, path: PathLike):
@@ -316,8 +326,8 @@ def translate_s3_error(s3_error: Exception, s3_url: PathLike) -> Exception:
     return S3UnknownError(s3_error, s3_url)
 
 
-def translate_http_error(http_error: Optional[Exception],
-                         http_url: str) -> Optional[Exception]:
+def translate_http_error(
+        http_error: Optional[Exception], http_url: str) -> Exception:
     '''Generate exception according to http_error and status_code
 
     .. note ::
